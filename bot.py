@@ -134,7 +134,6 @@ LOG_DIR = Path(__file__).parent / "logs"
 PID_FILE = Path(__file__).parent / "bot.pid"
 SESSION_STATE_FILE = Path(__file__).parent / "session-state.json"
 HISTORY_LENGTH = 10
-VOICE_ROTATION_TURNS = 7  # rotate voice session every N turns to prevent context bloat
 
 # --- Optional: Reel transcription (requires yt-dlp + whisper) ---
 YTDLP_PATH = os.environ.get("YTDLP_PATH", "yt-dlp")
@@ -171,11 +170,16 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 _groq_client: Groq | None = None
 
 # Known Whisper hallucination phrases (produced when given noise/silence)
+# Only filters utterances under 2.0 seconds — false positives on real short speech
+# are acceptable (user just repeats themselves).
 WHISPER_HALLUCINATIONS = {
     "thank you.", "thank you", "thanks for watching.", "thanks for watching!",
     "thanks for watching", "thank you for watching.", "thank you for watching",
     "please subscribe.", "like and subscribe.", "subscribe",
     "you", "",
+    "amen", "bye", "hmm", "oh", "ah", "shh", "so", "the end",
+    "music", "applause", "cheers", "silence", "laughter",
+    "okay", "yes", "no", "yeah", "mhm", "uh", "um",
 }
 
 def _get_groq_client() -> Groq | None:
@@ -221,34 +225,39 @@ _text_chat_lock: asyncio.Lock | None = None  # created in on_ready
 # Active remote-control process (one at a time)
 _remote_proc: asyncio.subprocess.Process | None = None
 
-# Persistent session IDs (text + voice, separate contexts)
+# Persistent session ID (text chat only — voice uses bot-managed context)
 _text_session_id: str | None = None
-_voice_session_id: str | None = None  # also stored in _voice_states per guild
 
 
 # --- Session state persistence ---
 
 def _load_session_state():
-    """Load persisted session IDs from disk."""
-    global _text_session_id, _voice_session_id
+    """Load persisted session state from disk."""
+    global _text_session_id
     if SESSION_STATE_FILE.exists():
         try:
             data = json.loads(SESSION_STATE_FILE.read_text(encoding="utf-8"))
             _text_session_id = data.get("text_session_id")
-            _voice_session_id = data.get("voice_session_id")
-            log.info("Loaded session state: text=%s, voice=%s",
-                     _text_session_id[:12] + "..." if _text_session_id else "none",
-                     _voice_session_id[:12] + "..." if _voice_session_id else "none")
+            log.info("Loaded session state: text=%s",
+                     _text_session_id[:12] + "..." if _text_session_id else "none")
+            # Restore voice session memory
+            for gid_str, memories in data.get("voice_session_memory", {}).items():
+                vs = _get_voice_state(int(gid_str))
+                vs["session_memory"] = memories
+                log.info("Loaded voice session memory for guild %s (%d entries)", gid_str, len(memories))
         except Exception as e:
             log.warning("Failed to load session state: %s", e)
 
 
 def _save_session_state():
-    """Persist session IDs to disk."""
+    """Persist session state to disk (text session ID + voice session memory)."""
     data = {
         "text_session_id": _text_session_id,
-        "voice_session_id": _voice_session_id,
         "last_updated": datetime.now().isoformat(),
+        "voice_session_memory": {
+            str(gid): vs.get("session_memory", [])
+            for gid, vs in _voice_states.items()
+        },
     }
     try:
         SESSION_STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -292,30 +301,21 @@ async def _fetch_channel_context(guild_id: int, limit: int = 20) -> str:
         return ""
 
 
-async def _rotate_voice_session(guild_id: int) -> None:
-    """Rotate the voice session to prevent context bloat.
-
-    Drops the session ID so the next call starts fresh. Discord channel
-    history provides continuity — no file-based RAM needed.
-    """
-    global _voice_session_id
-    vs = _get_voice_state(guild_id)
-
-    old_sid = _voice_session_id
-    _voice_session_id = None
-    _save_session_state()
-    vs["turn_count"] = 0
-    vs["history"].clear()
-
-    log.info("Voice: session rotated (was %s, turn_count reset, context from channel history)",
-             old_sid[:12] if old_sid else "none")
-
 
 # Voice state per guild
 _voice_text_channels: dict[int, int] = {}
 _voice_locks: dict[int, asyncio.Lock] = {}
 _voice_interrupted: dict[int, bool] = {}  # set by sink when user interrupts playback
-_voice_pipeline_task: dict[int, asyncio.Task] = {}  # active pipeline per guild — cancelled on new utterance
+_active_pipeline: dict[int, asyncio.Task] = {}    # post-filter, doing real work (Claude/TTS)
+_checking_pipeline: dict[int, asyncio.Task] = {}   # pre-filter, running STT check
+_pipeline_phase: dict[int, str] = {}        # "idle" | "llm" | "tts" per guild
+_utterance_queue: dict[int, list] = {}       # queued (transcript, user) during LLM
+_llm_start_time: dict[int, float] = {}       # when current LLM started
+_background_tasks: dict[int, dict] = {}      # background research tasks per guild
+
+CANCEL_PHRASES = {"stop", "cancel", "never mind", "forget it", "actually stop",
+                  "abort", "scratch that", "skip"}
+STATUS_PHRASES = {"status", "how long", "still working", "you there", "are you there"}
 _persistent_source: dict[int, "PersistentAudioSource"] = {}  # one per guild, plays forever
 _voice_deafened: set[int] = set()  # user IDs whose voice input is ignored
 
@@ -335,12 +335,51 @@ def _get_voice_state(guild_id: int) -> dict:
             # Each entry: {"spoken": [...], "pending": [...]}
             # Push on interrupt, pop on "continue". Supports cascading branches.
             "interrupt_stack": [],
-            "turn_count": 0,        # turns since last session rotation
+            "session_memory": [],      # extracted facts from Haiku — persists across restarts
+            "recent_turns": deque(maxlen=8),  # last 8 verbatim turns for tone/rapport
         }
-    return _voice_states[guild_id]
+    vs = _voice_states[guild_id]
+    # Backwards compat: ensure new fields exist on states created before this update
+    if "session_memory" not in vs:
+        vs["session_memory"] = []
+    if "recent_turns" not in vs:
+        vs["recent_turns"] = deque(maxlen=8)
+    return vs
 
 
 _voice_states: dict[int, dict] = {}
+
+
+async def _extract_memory(transcript: str, response: str, guild_id: int):
+    """Fire-and-forget Haiku extraction of session memory. Runs parallel with TTS."""
+    vs = _get_voice_state(guild_id)
+    existing = "\n".join(f"- {m}" for m in vs["session_memory"]) or "(none yet)"
+
+    extraction_prompt = (
+        "Extract 0-3 key facts from this exchange worth remembering for future conversation turns. "
+        "Focus on: decisions made, files examined + findings, tasks started/completed, user preferences. "
+        "Return ONLY new facts not already in existing memory. One fact per line, brief. "
+        "Return EMPTY if nothing new.\n\n"
+        f"Existing memory:\n{existing}\n\n"
+        f"User: {transcript}\n"
+        f"Assistant: {response[:1000]}"
+    )
+
+    try:
+        result, _ = await run_claude(extraction_prompt, model="haiku", timeout=15, session_id=None)
+        if result and result.strip().upper() != "EMPTY":
+            for line in result.strip().split("\n"):
+                line = line.strip().lstrip("- \u2022")
+                if line and len(line) > 5:
+                    vs["session_memory"].append(line)
+                    log.info("Voice: memory extracted: %s", line[:80])
+            # Cap at 20 entries
+            while len(vs["session_memory"]) > 20:
+                vs["session_memory"].pop(0)
+            _save_session_state()
+    except Exception as e:
+        log.warning("Voice: memory extraction failed: %s", e)
+
 
 VOICE_SYSTEM_PROMPT = (
     "You are in a live voice conversation via Discord. The user speaks, you respond "
@@ -445,7 +484,7 @@ def build_prompt(message: str, channel_id: int) -> str:
 
 # --- Claude subprocess ---
 
-async def run_claude(message: str, extra_system: str = "", session_id: str | None = None) -> tuple[str, str | None]:
+async def run_claude(message: str, extra_system: str = "", session_id: str | None = None, model: str | None = None, timeout: int = 300) -> tuple[str, str | None]:
     """Run claude -p subprocess. Returns (response_text, session_id).
 
     If session_id is provided, resumes that session (--resume).
@@ -463,7 +502,8 @@ async def run_claude(message: str, extra_system: str = "", session_id: str | Non
     if extra_system:
         system += "\n\n" + extra_system
 
-    cmd = ["claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "json",
+    use_model = model or CLAUDE_MODEL
+    cmd = ["claude", "-p", "--model", use_model, "--output-format", "json",
            "--append-system-prompt", system]
     if session_id:
         cmd.extend(["--resume", session_id])
@@ -479,12 +519,12 @@ async def run_claude(message: str, extra_system: str = "", session_id: str | Non
             cwd=CLAUDE_PROJECT_DIR,
             **kwargs,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(message.encode()), timeout=300)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(message.encode()), timeout=timeout)
     except asyncio.TimeoutError:
         elapsed = (datetime.now() - t0).total_seconds()
         log.error("Timed out after %.0fs. Killing process.", elapsed)
         proc.kill()
-        return "Timed out after 300s.", None
+        return f"Timed out after {timeout}s.", None
     elapsed = (datetime.now() - t0).total_seconds()
     stderr_text = stderr.decode().strip()
     if stderr_text:
@@ -1142,7 +1182,7 @@ class WhisperVADSink(_SinkBase):
             vs = _get_voice_state(self.guild_id)
             if vs["interrupted"] and vs["pending_chunks"]:
                 task = self.loop.create_task(_resume_interrupted_playback(self.guild_id))
-                _voice_pipeline_task[self.guild_id] = task
+                _active_pipeline[self.guild_id] = task
             return
 
         log.info("Voice: utterance from %s (%.1fs)", user, duration)
@@ -1161,16 +1201,16 @@ class WhisperVADSink(_SinkBase):
                 VAD_HOLDBACK_WINDOW, self._dispatch_holdback, user_id, pcm_data, user
             )
             return
-        # Cancel any in-flight pipeline for this guild before starting a new one
-        old_task = _voice_pipeline_task.get(self.guild_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
-            log.info("Voice: cancelled previous pipeline for new utterance")
+        # Cancel any pending CHECK only — don't kill active pipeline yet.
+        # Active pipeline gets cancelled inside process_voice_utterance AFTER filters pass.
+        old_check = _checking_pipeline.get(self.guild_id)
+        if old_check and not old_check.done():
+            old_check.cancel()
         # _on_silence runs on the event loop (via call_later), so create_task is correct
         task = self.loop.create_task(
             process_voice_utterance(pcm_data, user, self.guild_id)
         )
-        _voice_pipeline_task[self.guild_id] = task
+        _checking_pipeline[self.guild_id] = task
 
     def _start_false_interrupt_timer(self) -> None:
         """Schedule 2s false interruption recovery (called on event loop via call_soon_threadsafe)."""
@@ -1185,7 +1225,7 @@ class WhisperVADSink(_SinkBase):
         if not vs["interrupted"] or not vs["pending_chunks"]:
             return
         # If a real pipeline is already running, don't interfere
-        task = _voice_pipeline_task.get(self.guild_id)
+        task = _active_pipeline.get(self.guild_id)
         if task and not task.done():
             return
         # If user is still actively speaking, don't resume — let _on_silence handle it
@@ -1196,7 +1236,7 @@ class WhisperVADSink(_SinkBase):
             return
         log.info("Voice: false interruption (2s timeout) — auto-resuming playback")
         task = self.loop.create_task(_resume_interrupted_playback(self.guild_id))
-        _voice_pipeline_task[self.guild_id] = task
+        _active_pipeline[self.guild_id] = task
 
     def _start_force_flush_timer(self, user_id: int) -> None:
         """Schedule 3s force-flush (called on event loop via call_soon_threadsafe).
@@ -1256,13 +1296,14 @@ class WhisperVADSink(_SinkBase):
         if self._false_interrupt_timer is not None:
             self._false_interrupt_timer.cancel()
             self._false_interrupt_timer = None
-        old_task = _voice_pipeline_task.get(self.guild_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
+        # Cancel any pending check only — active pipeline cancelled after filters pass
+        old_check = _checking_pipeline.get(self.guild_id)
+        if old_check and not old_check.done():
+            old_check.cancel()
         task = self.loop.create_task(
             process_voice_utterance(pcm_data, user, self.guild_id)
         )
-        _voice_pipeline_task[self.guild_id] = task
+        _checking_pipeline[self.guild_id] = task
 
     def _dispatch_holdback(self, user_id: int, pcm_data: bytes, user) -> None:
         """Holdback timer expired — no continuation arrived, dispatch the short utterance."""
@@ -1270,13 +1311,14 @@ class WhisperVADSink(_SinkBase):
         self._holdback_timers.pop(user_id, None)
         duration = len(pcm_data) / (self.SAMPLE_RATE * self.CHANNELS * self.SAMPLE_WIDTH)
         log.info("Voice: holdback expired — dispatching short utterance from %s (%.2fs)", user, duration)
-        old_task = _voice_pipeline_task.get(self.guild_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
+        # Cancel any pending check only — active pipeline cancelled after filters pass
+        old_check = _checking_pipeline.get(self.guild_id)
+        if old_check and not old_check.done():
+            old_check.cancel()
         task = self.loop.create_task(
             process_voice_utterance(pcm_data, user, self.guild_id)
         )
-        _voice_pipeline_task[self.guild_id] = task
+        _checking_pipeline[self.guild_id] = task
 
     def cleanup(self) -> None:
         if self._false_interrupt_timer is not None:
@@ -1340,30 +1382,49 @@ def _split_into_chunks(text: str) -> list[str]:
 async def _build_voice_prompt(transcript: str, guild_id: int, skip_weave: bool = False) -> tuple[str, str]:
     """Build prompt + system context for voice conversation with weave support.
 
+    Three-tier context model:
+    - Tier 1: Session memory (compact, high-signal facts from Haiku extraction)
+    - Tier 2: Recent turns (verbatim last 8 turns for tone/rapport)
+    - Tier 3: System context (voice prompt, channel history, weave, background tasks)
+
     Returns (prompt, extra_system).
     """
     vs = _get_voice_state(guild_id)
 
-    # Build conversation history from voice-specific history
-    lines = []
-    for role, text in vs["history"]:
-        lines.append(f"{role}: {text}")
+    # Tier 1: Session memory (compact, high-signal)
+    memory_block = ""
+    if vs["session_memory"]:
+        memory_block = "Session memory (key context from this conversation):\n"
+        memory_block += "\n".join(f"- {m}" for m in vs["session_memory"])
 
+    # Tier 2: Recent turns (verbatim for tone/rapport)
     prompt_parts = []
-    if lines:
-        prompt_parts.append("Previous conversation:\n" + "\n".join(lines))
+    if vs["recent_turns"]:
+        recent = "\n".join(f"{role}: {text}" for role, text in vs["recent_turns"])
+        prompt_parts.append(f"Recent conversation:\n{recent}")
     prompt_parts.append(f"User: {transcript}")
     prompt = "\n\n".join(prompt_parts)
 
-    # Build continuation context from interrupt stack.
-    # Current response's interrupted state takes priority, then stack top.
-    # skip_weave=True when pop_stack fired — the transcript already has resume instructions.
+    # Tier 3: System context
     extra = VOICE_SYSTEM_PROMPT
-    # Inject channel history as context (replaces file-based RAM)
+    if memory_block:
+        extra += f"\n\n{memory_block}"
+
+    # Channel context for broader history
     channel_context = await _fetch_channel_context(guild_id)
     if channel_context:
-        extra += f"\n\n[Recent conversation history from this voice session]\n{channel_context}"
+        extra += f"\n\n[Recent voice session transcript]\n{channel_context}"
 
+    # Background task status
+    bg = _background_tasks.get(guild_id)
+    if bg:
+        if bg["status"] == "done":
+            extra += f"\n\nBACKGROUND TASK COMPLETE: '{bg['name']}' finished ({bg.get('elapsed', 0):.0f}s). Result summary: {bg.get('result', '')[:500]}"
+        elif bg["status"] == "running":
+            elapsed = time.time() - bg["started"]
+            extra += f"\n\nBACKGROUND TASK RUNNING: '{bg['name']}' ({elapsed:.0f}s so far). If user asks, tell them it's still running."
+
+    # === WEAVE CONTEXT (interrupt stack logic — unchanged) ===
     if skip_weave:
         int_spoken = []
         int_pending = []
@@ -1601,7 +1662,6 @@ async def process_voice_utterance(pcm_data: bytes, user: discord.User, guild_id:
 
     Supports 'the weave': interruptible playback with continuation tracking.
     """
-    global _voice_session_id
     text_channel_id = _voice_text_channels.get(guild_id)
     text_channel = bot.get_channel(text_channel_id) if text_channel_id else None
 
@@ -1656,13 +1716,22 @@ async def process_voice_utterance(pcm_data: bytes, user: discord.User, guild_id:
             return
 
         # Hallucination filter: reject known Whisper phantom phrases on short utterances
-        utterance_duration = len(pcm_data) / (48000 * 2)  # 16-bit mono, 48kHz
+        utterance_duration = len(pcm_data) / (48000 * 2 * 2)  # 16-bit stereo, 48kHz
         if transcript.lower().strip().rstrip('.!,') in WHISPER_HALLUCINATIONS or transcript.lower().strip() in WHISPER_HALLUCINATIONS:
             if utterance_duration < 2.0:
                 log.info("Voice: REJECTED hallucination from %s (%.1fs): \"%s\"", user, utterance_duration, transcript)
                 if vs["interrupted"] and vs["pending_chunks"]:
                     await _resume_interrupted_playback(guild_id)
                 return
+
+        # All filters passed — this is a real utterance. Cancel active pipeline.
+        old_active = _active_pipeline.get(guild_id)
+        if old_active and not old_active.done():
+            old_active.cancel()
+            log.info("Voice: cancelled active pipeline for confirmed utterance")
+        # Promote from checking to active
+        _active_pipeline[guild_id] = asyncio.current_task()
+        _checking_pipeline.pop(guild_id, None)
 
         log.info("Voice: [pipeline] STT done (%.1fs): \"%s\"", stt_elapsed, transcript[:100])
 
@@ -1717,39 +1786,54 @@ async def process_voice_utterance(pcm_data: bytes, user: discord.User, guild_id:
         elif pop_stack:
             log.info("Voice: POP STACK — but stack is empty, treating as normal utterance")
 
+        # --- Phase 4: Queue logic — check if LLM is already running ---
+        phase = _pipeline_phase.get(guild_id, "idle")
+        if phase == "llm":
+            t_lower = transcript.lower()
+            if any(phrase in t_lower for phrase in CANCEL_PHRASES):
+                old_active = _active_pipeline.get(guild_id)
+                if old_active and not old_active.done():
+                    old_active.cancel()
+                    log.info("Voice: explicit cancel during LLM: \"%s\"", transcript[:50])
+                # Fall through to process this as new utterance
+            elif any(phrase in t_lower for phrase in STATUS_PHRASES):
+                elapsed = int(time.time() - _llm_start_time.get(guild_id, time.time()))
+                await _play_quick_tts(f"Still working on it. {elapsed} seconds so far.", guild_id)
+                return
+            else:
+                # Queue for after current LLM completes
+                _utterance_queue.setdefault(guild_id, []).append((transcript, user))
+                log.info("Voice: queued utterance during LLM (%d in queue): \"%s\"",
+                         len(_utterance_queue[guild_id]), transcript[:50])
+                if text_channel:
+                    await text_channel.send(f"**{user.display_name}:** {transcript}\n*\u21b3 Queued (processing previous request)*")
+                return
+
         log.info("Voice: [pipeline] step 2 — Claude LLM")
         llm_t0 = datetime.now()
         # Don't auto-pop after explicit pop_stack — user controls the unwind
         had_weave_context = False if _did_pop_stack else (bool(vs["interrupt_stack"]) and not vs["interrupted"])
         prompt, extra_system = await _build_voice_prompt(transcript, guild_id, skip_weave=_did_pop_stack)
+        _pipeline_phase[guild_id] = "llm"
+        _llm_start_time[guild_id] = time.time()
         response, new_sid = await run_claude(
             prompt, extra_system=extra_system,
-            session_id=_voice_session_id,
+            session_id=None,  # voice uses bot-managed context, not --resume
         )
+        _pipeline_phase[guild_id] = "tts"
         llm_elapsed = (datetime.now() - llm_t0).total_seconds()
         log.info("Voice: [pipeline] LLM done (%.1fs, %d chars)", llm_elapsed, len(response))
 
-        # Persist Claude session for future calls
-        if new_sid:
-            if _voice_session_id != new_sid:
-                log.info("Voice: Claude session %s → %s",
-                         _voice_session_id[:12] if _voice_session_id else "none",
-                         new_sid[:12])
-            _voice_session_id = new_sid
-            _save_session_state()
+        # Fire memory extraction parallel with TTS
+        asyncio.create_task(_extract_memory(transcript, response, guild_id))
 
-        # Update voice history (kept as fallback context if session expires)
+        # Update recent turns (for three-tier context building)
+        vs["recent_turns"].append(("User", transcript))
+        vs["recent_turns"].append(("Assistant", response[:500]))
+
+        # Update voice history (kept for text channel posting)
         vs["history"].append(("User", transcript))
         vs["history"].append(("Assistant", response[:500]))
-
-        # Track turns and rotate session when it gets bloated
-        vs["turn_count"] += 1
-        if vs["turn_count"] >= VOICE_ROTATION_TURNS and _voice_session_id:
-            log.info("Voice: turn %d reached rotation threshold (%d), rotating session",
-                     vs["turn_count"], VOICE_ROTATION_TURNS)
-            if text_channel:
-                await text_channel.send("*Rotating voice session to keep responses fast...*")
-            await _rotate_voice_session(guild_id)
 
         # Post full response to text channel
         if text_channel:
@@ -1815,16 +1899,205 @@ async def process_voice_utterance(pcm_data: bytes, user: discord.User, guild_id:
         else:
             _log_post_playback_state(guild_id)
 
+        # Set phase to idle and drain queued utterances
+        _pipeline_phase[guild_id] = "idle"
+        queue = _utterance_queue.pop(guild_id, [])
+        if queue:
+            combined = " | ".join(t for t, u in queue)
+            log.info("Voice: draining %d queued utterances", len(queue))
+            asyncio.create_task(process_voice_utterance_from_transcript(combined, queue[0][1], guild_id))
+
     except asyncio.CancelledError:
         log.info("Voice: pipeline cancelled (new utterance arrived)")
+        _pipeline_phase[guild_id] = "idle"
         psrc = _persistent_source.get(guild_id)
         if psrc:
             psrc.interrupt()
         return
     except Exception as e:
         log.error("Voice pipeline error: %s", e, exc_info=True)
+        _pipeline_phase[guild_id] = "idle"
         if text_channel:
             await text_channel.send(f"Voice pipeline error: {e}")
+
+
+async def process_voice_utterance_from_transcript(transcript: str, user, guild_id: int):
+    """Process a pre-transcribed utterance (from queue drain). Skips STT/filters."""
+    vs = _get_voice_state(guild_id)
+    text_channel_id = _voice_text_channels.get(guild_id)
+    text_channel = bot.get_channel(text_channel_id) if text_channel_id else None
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    voice_client = guild.voice_client
+    if voice_client is None or not voice_client.is_connected():
+        return
+
+    # Post to text channel
+    if text_channel:
+        await text_channel.send(f"*Processing queued: {transcript[:100]}*")
+
+    try:
+        # Build prompt and call Claude
+        prompt, extra_system = await _build_voice_prompt(transcript, guild_id)
+
+        _pipeline_phase[guild_id] = "llm"
+        _llm_start_time[guild_id] = time.time()
+        _active_pipeline[guild_id] = asyncio.current_task()
+
+        response, _ = await run_claude(prompt, extra_system=extra_system, session_id=None)
+        _pipeline_phase[guild_id] = "tts"
+
+        # Memory extraction
+        asyncio.create_task(_extract_memory(transcript, response, guild_id))
+        vs["recent_turns"].append(("User", transcript))
+        vs["recent_turns"].append(("Assistant", response[:500]))
+        vs["history"].append(("User", transcript))
+        vs["history"].append(("Assistant", response[:500]))
+
+        # Post response to text channel
+        if text_channel:
+            for chunk in split_message(response):
+                await text_channel.send(f"> {chunk}")
+
+        # TTS playback
+        chunks = _split_into_chunks(response)
+        if chunks:
+            loop = asyncio.get_event_loop()
+            vs["full_response"] = response
+            vs["pending_chunks"] = []
+            vs["spoken_chunks"] = []
+            vs["interrupted"] = False
+
+            spoken, pending = await play_chunks_with_interruption(
+                chunks, voice_client, guild_id, loop,
+            )
+            vs["spoken_chunks"] = spoken
+            vs["pending_chunks"] = pending
+            was_interrupted = _voice_interrupted.get(guild_id, False)
+            vs["interrupted"] = bool(pending) or was_interrupted
+
+            if vs["interrupted"]:
+                vs["interrupt_stack"].append({
+                    "spoken": list(spoken),
+                    "pending": list(pending),
+                })
+
+        _pipeline_phase[guild_id] = "idle"
+
+        # Drain any further queued utterances
+        queue = _utterance_queue.pop(guild_id, [])
+        if queue:
+            combined = " | ".join(t for t, u in queue)
+            log.info("Voice: draining %d queued utterances (from transcript handler)", len(queue))
+            asyncio.create_task(process_voice_utterance_from_transcript(combined, queue[0][1], guild_id))
+
+    except asyncio.CancelledError:
+        _pipeline_phase[guild_id] = "idle"
+        psrc = _persistent_source.get(guild_id)
+        if psrc:
+            psrc.interrupt()
+        return
+    except Exception as e:
+        _pipeline_phase[guild_id] = "idle"
+        log.error("Voice queued pipeline error: %s", e, exc_info=True)
+        if text_channel:
+            await text_channel.send(f"Voice pipeline error (queued): {e}")
+
+
+async def _play_quick_tts(text: str, guild_id: int):
+    """Play a short TTS message without going through Claude. For status queries."""
+    psrc = _persistent_source.get(guild_id)
+    if not psrc:
+        return
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    voice_client = guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        return
+    try:
+        mp3_path = await synthesize_speech(text)
+        ffmpeg_source = discord.FFmpegOpusAudio(str(mp3_path), executable=FFMPEG_PATH)
+        done = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        psrc.set_source(ffmpeg_source, done, loop)
+        await done.wait()
+        for _ in range(5):
+            try:
+                mp3_path.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                await asyncio.sleep(0.2)
+    except Exception as e:
+        log.warning("Voice: quick TTS failed: %s", e)
+
+
+async def spawn_background_task(guild_id: int, prompt: str, task_name: str):
+    """Spawn an independent Claude process for background research."""
+    vs = _get_voice_state(guild_id)
+    bg_context = "\n".join(f"- {m}" for m in vs["session_memory"][-10:])
+
+    bg_prompt = (
+        f"You are running a background research task for a voice assistant.\n"
+        f"Session context:\n{bg_context}\n\n"
+        f"Task: {prompt}\n\n"
+        f"Be thorough. Write your complete findings."
+    )
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    proc = await asyncio.create_subprocess_exec(
+        "claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "json",
+        "--append-system-prompt", SYSTEM_PROMPT,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=CLAUDE_PROJECT_DIR,
+        **kwargs,
+    )
+
+    _background_tasks[guild_id] = {
+        "proc": proc,
+        "name": task_name,
+        "started": time.time(),
+        "status": "running",
+    }
+
+    asyncio.create_task(_monitor_background(guild_id, proc, bg_prompt, task_name))
+    log.info("Voice: spawned background task '%s'", task_name)
+    return task_name
+
+
+async def _monitor_background(guild_id: int, proc, prompt: str, task_name: str):
+    """Monitor a background Claude process and capture results."""
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=600)
+        result_text = json.loads(stdout.decode())["result"]
+    except Exception as e:
+        result_text = f"Background task failed: {e}"
+
+    elapsed = time.time() - _background_tasks[guild_id]["started"]
+    _background_tasks[guild_id]["status"] = "done"
+    _background_tasks[guild_id]["result"] = result_text[:2000]
+    _background_tasks[guild_id]["elapsed"] = elapsed
+
+    # Add to session memory
+    vs = _get_voice_state(guild_id)
+    vs["session_memory"].append(f"Background task '{task_name}' completed ({int(elapsed)}s). Key finding: {result_text[:200]}")
+
+    log.info("Voice: background task '%s' completed (%.0fs, %d chars)", task_name, elapsed, len(result_text))
+
+    # Announce via text channel
+    text_channel_id = _voice_text_channels.get(guild_id)
+    text_channel = bot.get_channel(text_channel_id) if text_channel_id else None
+    if text_channel:
+        await text_channel.send(f"**Background task complete:** {task_name} ({int(elapsed)}s)\n> {result_text[:500]}")
 
 
 # --- Bot setup ---
@@ -1987,13 +2260,14 @@ async def voicestop_command(interaction: discord.Interaction):
         vc.stop()
     await vc.disconnect()
 
-    # Clean up persistent source and any in-flight pipeline
+    # Clean up persistent source and any in-flight pipelines
     psrc = _persistent_source.pop(guild.id, None)
     if psrc:
         psrc.cleanup()
-    old_task = _voice_pipeline_task.pop(guild.id, None)
-    if old_task and not old_task.done():
-        old_task.cancel()
+    for pipeline_dict in (_active_pipeline, _checking_pipeline):
+        old_task = pipeline_dict.pop(guild.id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
 
     _voice_text_channels.pop(guild.id, None)
     _voice_locks.pop(guild.id, None)
@@ -2001,11 +2275,11 @@ async def voicestop_command(interaction: discord.Interaction):
     # NOTE: _voice_states is NOT cleared — session persists across leave/rejoin.
     # Only /session_close resets conversation context.
 
-    # Extract voice transcript to Inbox
-    extract_msg = await _extract_session_to_inbox(_voice_session_id, "voice")
+    # Voice no longer uses --resume sessions, so no session to extract.
+    # Session memory persists in _voice_states across leave/rejoin.
 
     log.info("Voice: disconnected from guild %s", guild)
-    await interaction.followup.send(f"Disconnected from voice channel.\n{extract_msg}")
+    await interaction.followup.send("Disconnected from voice channel.")
 
 
 @tree.command(name="deafen", description="Toggle whether the bot listens to your voice", guild=guild_obj)
@@ -2157,11 +2431,13 @@ async def remotestop_command(interaction: discord.Interaction):
 
 @tree.command(name="session_close", description="Reset conversation context, extract transcripts to Inbox", guild=guild_obj)
 async def session_close_command(interaction: discord.Interaction):
-    global _text_session_id, _voice_session_id
+    global _text_session_id
     if not is_authorized(interaction.user.id):
         return
 
-    if not _text_session_id and not _voice_session_id:
+    has_text = bool(_text_session_id)
+    has_voice = any(vs.get("session_memory") or vs.get("history") for vs in _voice_states.values())
+    if not has_text and not has_voice:
         await interaction.response.send_message("No active sessions to close.")
         return
 
@@ -2176,13 +2452,6 @@ async def session_close_command(interaction: discord.Interaction):
         log.info("session_close: cleared text session %s", _text_session_id[:12])
         _text_session_id = None
 
-    # Extract voice session
-    if _voice_session_id:
-        msg = await _extract_session_to_inbox(_voice_session_id, "voice")
-        results.append(msg)
-        log.info("session_close: cleared voice session %s", _voice_session_id[:12])
-        _voice_session_id = None
-
     # Clear in-memory conversation histories
     chat_history.clear()
     for vs in _voice_states.values():
@@ -2192,9 +2461,8 @@ async def session_close_command(interaction: discord.Interaction):
         vs["spoken_chunks"].clear()
         vs["full_response"] = ""
         vs["interrupted"] = False
-        vs["turn_count"] = 0
-
-    # No file-based RAM to clear — Discord channel history is the memory
+        vs["session_memory"].clear()
+        vs["recent_turns"].clear()
 
     _save_session_state()
 
