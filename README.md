@@ -13,11 +13,11 @@ Chat with Claude, start remote coding sessions, capture notes to your Obsidian v
 | `/remotestop` | Kill the active remote session |
 | `/capture <text>` | Save a quick note to your vault inbox |
 | `/reel <url>` | Transcribe an Instagram reel (requires yt-dlp + Whisper) |
-| `/session` | Create a session RAM file for Claude context tracking |
 | `/session_close` | Close the session (sweep decisions, delete RAM) |
 | `/voice` | Join your voice channel — listen, transcribe, respond via TTS |
 | `/voicestop` | Leave voice channel and extract transcript to Inbox |
 | `/deafen` | Toggle whether the bot listens to your voice |
+| `/restart` | Restart the bot process |
 | `/shutdown` | Shut down the bot gracefully |
 | *(free text)* | Send any message and Claude will respond |
 
@@ -65,7 +65,6 @@ Enable **Developer Mode** in Discord (Settings → Advanced → Developer Mode),
 
 **Text-only (chat, /capture, /remote):**
 ```bash
-cd tools/discord-bot
 pip install discord.py python-dotenv edge-tts
 ```
 
@@ -119,14 +118,74 @@ Copy `start-bot.bat` to your Startup folder:
 
 This launches the bot in the background (no console window) on login.
 
-## How It Works
+## Architecture
 
-### Free-Text Chat
+### Text Chat
 
 Type any message in a channel the bot can see. The bot:
 1. Builds a prompt with the last 10 messages of conversation history
-2. Runs `claude -p --model sonnet --append-system-prompt "..."` as a subprocess
+2. Runs `claude -p --resume <session_id>` as a subprocess with multi-turn continuity
 3. Returns Claude's response, chunked at 2000 chars (Discord's limit)
+
+Text chat uses `--resume` for full conversation continuity across messages.
+
+### Voice Pipeline
+
+The voice system has a multi-stage pipeline with three layers of protection against false triggers:
+
+```
+Discord PCM (48kHz stereo)
+    |
+    v
+Silero VAD (speech detection)
+    |
+    v
+Deferred dispatch (cancel-safe)
+    |
+    v
+Volume gate (-30 dBFS floor)
+    |
+    v
+Groq Whisper STT (~0.5s)
+    |
+    v
+Hallucination filter (blocklist + duration gate)
+    |
+    v
+Utterance queue (if Claude is already working)
+    |
+    v
+Claude Code (with vault access)
+    |
+    v
+Edge TTS (paragraph-by-paragraph playback)
+```
+
+**Deferred cancellation**: New speech never kills in-flight Claude work until it passes all filters. Road noise that gets volume-rejected doesn't cancel your research. This is the key architectural difference from naive voice bots.
+
+**Session memory**: Voice doesn't use `--resume`. Instead, the bot manages context directly with a three-tier model:
+
+| Tier | What | Size |
+|------|------|------|
+| Session memory | Key facts extracted by Haiku after each turn | ~200-500 tokens |
+| Recent turns | Last 8 turns verbatim (for tone/rapport) | ~500-2000 tokens |
+| System context | Interrupt state, background tasks, channel history | ~100-300 tokens |
+
+Total context per call stays flat at ~800-2800 tokens regardless of session length. No rotation, no context loss, no growing latency.
+
+**Memory extraction**: After each Claude response, a lightweight Haiku call runs in parallel with TTS to extract key facts (decisions made, files examined, task progress). These accumulate as session memory and persist across bot restarts via `session-state.json`.
+
+**Interruption handling**: Interrupt the bot mid-response. It tracks what was said vs. unsaid. Say "continue" to resume, or ask something new. Interrupts stack (FILO) — "pop stack" unwinds to a previous topic.
+
+**Utterance queue**: If you speak while Claude is processing a request, your utterance is queued (not dropped). When Claude finishes, queued utterances are processed next. Say "cancel" or "stop" to kill in-flight work instead.
+
+**Status queries**: Ask "are you there?" or "status" during a long Claude operation and the bot responds immediately with elapsed time, without interrupting the work.
+
+**Background tasks**: Deep research or analysis can run in a separate Claude process while you continue conversing. Background results are added to session memory and announced when complete.
+
+**Decision tracking**: The voice system prompt instructs Claude to write decisions to the Decision Log as they happen. This is how voice sessions communicate with desktop Claude Code sessions — both read/write the same Decision Log with a `source` column (`voice` or `desktop`).
+
+**Session extraction**: On `/voicestop` or `/session_close`, the bot runs an extraction script against the Claude session's JSONL transcript. It produces a structured report (decisions, file modifications, topics discussed) saved to your inbox. The Discord text channel also contains the full conversation transcript.
 
 ### /remote
 
@@ -140,37 +199,13 @@ Creates a markdown file in your inbox folder with frontmatter and the captured t
 
 Downloads an Instagram reel with yt-dlp, transcribes the audio with Whisper, and saves a vault note with metadata + transcript.
 
-### /session
-
-Creates a `session-{N}-ram.md` file for tracking what Claude does across multiple interactions. When active, the bot injects session context into Claude's system prompt. `/session_close` asks Claude to sweep for decisions before deleting the RAM file.
-
-### /voice — Voice Pipeline
-
-The voice system is the most complex feature. Here's how it works:
-
-1. **Listen**: Discord sends 20ms PCM audio frames. Silero VAD detects speech onset/offset.
-2. **Buffer**: Speech is buffered until silence is detected (2.5s timeout). Short utterances (<2s) are held briefly to merge fragments from natural pauses.
-3. **Transcribe**: PCM is converted to WAV and sent to Groq's Whisper API for cloud STT (~0.5s).
-4. **Think**: Transcript is sent to `claude -p --resume` with conversation context. Claude has access to your vault via CLAUDE.md.
-5. **Speak**: Response is chunked into paragraphs, synthesized via edge-tts, and played back through Discord.
-
-**Interruption handling**: You can interrupt the bot mid-response. It tracks what was said vs. unsaid. Say "continue" to resume, or ask something new. Interrupts stack — "pop stack" unwinds to a previous topic.
-
-**Session rotation**: After every 7 voice turns, the Claude session is dropped and restarted fresh. This prevents context accumulation from slowing down responses (a 20-turn session can take 3x longer per response). Discord channel history is injected as context for the new session, so continuity is preserved.
-
-**Decision tracking**: The voice system prompt instructs Claude to write decisions to the Decision Log as they happen. This is how voice sessions communicate with desktop Claude Code sessions — both read/write the same Decision Log with a `source` column (`voice` or `desktop`).
-
-**Session extraction**: On `/voicestop` or `/session_close`, the bot runs an extraction script against the Claude session's JSONL transcript. It produces a structured report (decisions, file modifications, topics discussed) saved to your inbox. The Discord text channel also contains the full conversation transcript (every user message and bot response is posted there).
-
 ### Logs
 
-The bot writes logs to a `logs/` directory (created automatically, gitignored). The main log file is `logs/bot.log`. Each voice pipeline call is logged with timing breakdowns:
+The bot writes logs to a `logs/` directory (created automatically, gitignored). Each voice pipeline call is logged with timing breakdowns:
 
 ```
 Voice: [pipeline] COMPLETE — STT=0.5s LLM=7.7s TTS=5.3s total=14.1s | spoke 1/1 chunks
 ```
-
-This helps diagnose latency issues — STT and TTS are usually fast, LLM time is where session bloat shows up.
 
 ## Configuration Reference
 
@@ -182,13 +217,13 @@ This helps diagnose latency issues — STT and TTS are usually fast, LLM time is
 | `CLAUDE_PROJECT_DIR` | No | Current directory | Where `claude -p` runs from |
 | `VAULT_PATH` | No | `CLAUDE_PROJECT_DIR` | Obsidian vault root |
 | `INBOX_PATH` | No | `VAULT_PATH/01_Inbox` | Where `/capture` saves notes |
-| `SCRATCHPAD_DIR` | No | `CLAUDE_PROJECT_DIR/Scratchpad` | Where `/session` creates files |
-| `CLAUDE_MODEL` | No | `sonnet` | Claude model (haiku/sonnet/opus) |
+| `SCRATCHPAD_DIR` | No | `CLAUDE_PROJECT_DIR/Scratchpad` | Session RAM files |
+| `CLAUDE_MODEL` | No | `sonnet` | Claude model for main responses |
 | `SYSTEM_PROMPT` | No | *(concise mode)* | System prompt for Claude subprocess |
 | `YTDLP_PATH` | No | `yt-dlp` | Path to yt-dlp binary |
 | `REEL_OUTPUT_DIR` | No | `VAULT_PATH/05_Reference/Instagram` | Where `/reel` saves transcripts |
-| `FFMPEG_PATH` | No | `ffmpeg` | Path to FFmpeg binary (voice TTS playback) |
-| `GROQ_API_KEY` | No | — | Groq API key for cloud speech-to-text |
+| `FFMPEG_PATH` | No | `ffmpeg` | Path to FFmpeg binary |
+| `GROQ_API_KEY` | No | — | Groq API key for speech-to-text |
 | `TTS_VOICE` | No | `en-US-JennyNeural` | Edge TTS voice name |
 | `TTS_RATE` | No | `+25%` | TTS speed adjustment |
 | `VAD_SILENCE_TIMEOUT` | No | `2.5` | Seconds of silence before dispatching |
@@ -196,7 +231,6 @@ This helps diagnose latency issues — STT and TTS are usually fast, LLM time is
 | `VAD_SHORT_UTTERANCE_SECS` | No | `2.0` | Holdback threshold for short utterances |
 | `VAD_HOLDBACK_WINDOW` | No | `3.0` | Seconds to wait for follow-on speech |
 | `MIN_VOLUME_DBFS` | No | `-30` | dBFS floor for volume rejection |
-| `VOICE_ROTATION_TURNS` | No | `7` | Rotate Claude session every N turns |
 
 ## Security
 
